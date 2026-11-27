@@ -14,6 +14,15 @@ const IMAGE_MODEL = "@cf/black-forest-labs/flux-1-schnell";
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  console.log(`[http] ${req.method} ${req.path} received`);
+  res.on("finish", () => {
+    console.log(`[http] ${req.method} ${req.path} -> ${res.statusCode} in ${Date.now() - startedAt}ms`);
+  });
+  next();
+});
+
 app.get("/", (req, res) => {
   res.json({
     name: "VORTEX AI",
