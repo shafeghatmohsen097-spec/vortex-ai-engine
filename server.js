@@ -35,10 +35,15 @@ app.get("/api/health", (req, res) => {
 });
 
 app.post("/api/image", async (req, res, next) => {
+  const requestId = Math.random().toString(36).slice(2, 8);
+  const startedAt = Date.now();
+
   try {
+    console.log(`[image:${requestId}] Request received`);
     const { prompt } = req.body || {};
 
     if (!prompt || typeof prompt !== "string" || !prompt.trim()) {
+      console.log(`[image:${requestId}] Rejected: missing prompt`);
       return res.status(400).json({
         success: false,
         error: "Please provide an image prompt."
@@ -46,6 +51,7 @@ app.post("/api/image", async (req, res, next) => {
     }
 
     if (prompt.trim().length > 2048) {
+      console.log(`[image:${requestId}] Rejected: prompt too long`);
       return res.status(400).json({
         success: false,
         error: "Prompt must be 2048 characters or fewer."
@@ -53,13 +59,15 @@ app.post("/api/image", async (req, res, next) => {
     }
 
     if (!CLOUDFLARE_ACCOUNT_ID || !CLOUDFLARE_API_TOKEN) {
+      console.error(`[image:${requestId}] Missing Cloudflare credentials`);
       return res.status(503).json({
         success: false,
-        error: "Image engine is not configured. Add Cloudflare credentials to the server environment."
+        error: "Image engine is not configured."
       });
     }
 
     const endpoint = `https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/run/${IMAGE_MODEL}`;
+    console.log(`[image:${requestId}] Sending request to Cloudflare model ${IMAGE_MODEL}`);
 
     const response = await fetch(endpoint, {
       method: "POST",
@@ -71,13 +79,27 @@ app.post("/api/image", async (req, res, next) => {
         prompt: prompt.trim(),
         steps: 4
       }),
-      signal: AbortSignal.timeout(120000)
+      signal: AbortSignal.timeout(90000)
     });
 
-    const data = await response.json();
+    console.log(`[image:${requestId}] Cloudflare responded: HTTP ${response.status}; content-type: ${response.headers.get("content-type") || "unknown"}`);
+
+    const rawBody = await response.text();
+    let data;
+
+    try {
+      data = JSON.parse(rawBody);
+    } catch {
+      console.error(`[image:${requestId}] Cloudflare returned non-JSON data; body length: ${rawBody.length}`);
+      return res.status(502).json({
+        success: false,
+        error: "The image provider returned an unexpected response.",
+        providerStatus: response.status
+      });
+    }
 
     if (!response.ok || !data.success || !data.result?.image) {
-      console.error("Cloudflare image generation failed:", {
+      console.error(`[image:${requestId}] Cloudflare image generation failed:`, {
         status: response.status,
         errors: data.errors
       });
@@ -85,9 +107,12 @@ app.post("/api/image", async (req, res, next) => {
       return res.status(502).json({
         success: false,
         error: "The image provider could not complete the request.",
-        providerStatus: response.status
+        providerStatus: response.status,
+        providerErrors: data.errors
       });
     }
+
+    console.log(`[image:${requestId}] Image generated successfully in ${Date.now() - startedAt}ms; base64 length: ${data.result.image.length}`);
 
     return res.json({
       success: true,
@@ -95,6 +120,8 @@ app.post("/api/image", async (req, res, next) => {
       image: `data:image/jpeg;base64,${data.result.image}`
     });
   } catch (error) {
+    console.error(`[image:${requestId}] Request failed after ${Date.now() - startedAt}ms:`, error.name, error.message);
+
     if (error.name === "TimeoutError" || error.name === "AbortError") {
       return res.status(504).json({
         success: false,
