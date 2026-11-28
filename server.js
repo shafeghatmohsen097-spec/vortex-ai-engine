@@ -176,6 +176,19 @@ app.get("/api/video/status", (req, res) => {
   });
 });
 
+app.get("/api/video/queue-status", (req, res) => {
+  const configured = Boolean(process.env.VORTEX_AGNES_API_KEY);
+  res.json({
+    success: true,
+    check: "local_queue",
+    queueSystem: "single_slot",
+    state: videoBusy ? "busy" : "idle",
+    acceptingRequests: configured && !videoBusy,
+    providerQueuePosition: null,
+    note: "This checks VORTEX server availability only. Agnes queue position is available only after a task is created."
+  });
+});
+
 app.post("/api/video", async (req, res) => {
   const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
   const duration = Number(req.body?.duration ?? 5);
