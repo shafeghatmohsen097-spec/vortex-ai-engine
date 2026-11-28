@@ -34,12 +34,15 @@ app.get("/", (req, res) => {
 app.get("/api/health", (req, res) => {
   const imageConfigured = Boolean(CLOUDFLARE_ACCOUNT_ID && CLOUDFLARE_API_TOKEN);
 
+  const videoConfigured = Boolean(process.env.VORTEX_AGNES_API_KEY);
   res.json({
     success: true,
     server: "online",
     imageEngine: imageConfigured ? "configured" : "missing_credentials",
     imageModel: IMAGE_MODEL,
-    skeletonEngine: "not_connected"
+    skeletonEngine: "not_connected",
+    videoEngine: videoConfigured ? "connected" : "free_provider_setup_required",
+    videoModel: "agnes-video-2.5-flash"
   });
 });
 
@@ -155,6 +158,160 @@ app.post("/api/skeleton", (req, res) => {
     success: false,
     error: "Skeleton motion model is not connected yet."
   });
+});
+
+
+let videoBusy = false;
+
+app.get("/api/video/status", (req, res) => {
+  const configured = Boolean(process.env.VORTEX_AGNES_API_KEY);
+  res.json({
+    success: true,
+    engine: configured ? "connected" : "free_provider_setup_required",
+    model: "agnes-video-2.5-flash",
+    configured,
+    maxSeconds: 12,
+    resolution: "720p",
+    pricing: "promotional-free-subject-to-provider-policy"
+  });
+});
+
+app.post("/api/video", async (req, res) => {
+  const prompt = typeof req.body?.prompt === "string" ? req.body.prompt.trim() : "";
+  const duration = Number(req.body?.duration ?? 5);
+  const aspectRatio = req.body?.aspect_ratio;
+  const image = req.body?.image;
+  const apiKey = process.env.VORTEX_AGNES_API_KEY;
+
+  if (!prompt || prompt.length > 3000) {
+    return res.status(400).json({ success: false, error: "Prompt must contain 1 to 3000 characters." });
+  }
+  if (!Number.isInteger(duration) || duration < 4 || duration > 12) {
+    return res.status(400).json({ success: false, error: "Video duration must be between 4 and 12 seconds." });
+  }
+  if (!["9:16", "16:9", "1:1", "4:3", "3:4", "21:9"].includes(aspectRatio)) {
+    return res.status(400).json({ success: false, error: "Unsupported aspect ratio." });
+  }
+  if (!apiKey) {
+    return res.status(503).json({
+      success: false,
+      error: "کلید اتصال Agnes روی همین سرویس Render تنظیم نشده است؛ هیچ درخواست ویدیویی ارسال نشد."
+    });
+  }
+  if (image !== undefined && image !== null) {
+    const validDataImage = typeof image === "string" && /^data:image\/(jpeg|jpg|png|webp);base64,/i.test(image);
+    const validHttpsUrl = typeof image === "string" && /^https:\/\/[^\s]+$/i.test(image);
+    if (!validDataImage && !validHttpsUrl) {
+      return res.status(400).json({ success: false, error: "Reference image must be a JPEG, PNG, or WebP data URI or HTTPS URL." });
+    }
+    if (validDataImage && image.length > 8 * 1024 * 1024) {
+      return res.status(413).json({ success: false, error: "Reference image is too large. Maximum file size is 6 MB." });
+    }
+  }
+  if (videoBusy) {
+    return res.status(429).json({ success: false, error: "The video engine is busy. Please try again shortly." });
+  }
+
+  videoBusy = true;
+  try {
+    const payload = {
+      model: "agnes-video-2.5-flash",
+      prompt,
+      mode: image ? "img2video" : "text",
+      seconds: String(duration),
+      size: "720P",
+      aspect_ratio: aspectRatio,
+      n: 1
+    };
+    if (image) payload.first_frame = image;
+
+    const createResponse = await fetch("https://apihub.agnes-ai.com/v1/videos", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + apiKey,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(60000)
+    });
+    const created = await createResponse.json().catch(() => null);
+    if (!createResponse.ok) {
+      console.error("Agnes video create failed:", createResponse.status, created?.error || created?.message || "");
+      return res.status(createResponse.status === 429 ? 429 : 502).json({
+        success: false,
+        error: createResponse.status === 429
+          ? "صف درخواست‌های رایگان شلوغ است یا محدودیت درخواست فعال شده؛ کمی بعد دوباره امتحان کن."
+          : "Agnes could not accept the video request.",
+        details: created?.error?.message || created?.message || created?.error || undefined
+      });
+    }
+
+    const videoId = created?.video_id || created?.id || created?.task_id;
+    if (!videoId) {
+      console.error("Agnes response missing video id:", JSON.stringify(created || {}).slice(0, 1500));
+      return res.status(502).json({ success: false, error: "Agnes did not return a video task ID." });
+    }
+
+    const pollUrl = new URL("https://apihub.agnes-ai.com/agnesapi");
+    pollUrl.searchParams.set("video_id", videoId);
+    pollUrl.searchParams.set("model_name", "agnes-video-2.5-flash");
+
+    let result = null;
+    const deadline = Date.now() + 210000;
+    let waitMs = 5000;
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      const pollResponse = await fetch(pollUrl, {
+        headers: { Authorization: "Bearer " + apiKey },
+        signal: AbortSignal.timeout(30000)
+      });
+      result = await pollResponse.json().catch(() => null);
+      if (!pollResponse.ok) {
+        if ([408, 429, 500, 502, 503, 504, 520, 522, 524].includes(pollResponse.status)) {
+          waitMs = Math.min(waitMs * 1.5, 15000);
+          continue;
+        }
+        return res.status(502).json({ success: false, error: "Could not check Agnes video status." });
+      }
+      const status = String(result?.status || "").toLowerCase();
+      if (["completed", "succeeded", "success", "done"].includes(status)) break;
+      if (["failed", "error", "cancelled"].includes(status)) {
+        return res.status(502).json({
+          success: false,
+          error: "Agnes video generation failed.",
+          details: result?.error || undefined
+        });
+      }
+      waitMs = Math.min(waitMs * 1.25, 12000);
+    }
+
+    const videoUrl = result?.url || result?.metadata?.url || result?.video_url;
+    if (!videoUrl || typeof videoUrl !== "string" || !videoUrl.startsWith("https://")) {
+      return res.status(504).json({
+        success: false,
+        error: "ویدیوسازی هنوز در صف است و زمان انتظار سرور تمام شد. کمی بعد دوباره تلاش کن."
+      });
+    }
+
+    return res.json({
+      success: true,
+      model: "agnes-video-2.5-flash",
+      video: videoUrl,
+      video_id: videoId,
+      duration,
+      resolution: "720p",
+      pricing: "promotional-free-subject-to-provider-policy"
+    });
+  } catch (error) {
+    console.error("VORTEX Agnes video error:", error.message);
+    const timeout = error.name === "TimeoutError" || error.name === "AbortError";
+    return res.status(timeout ? 504 : 502).json({
+      success: false,
+      error: timeout ? "Video generation timed out while waiting for Agnes." : "Could not reach the Agnes video service."
+    });
+  } finally {
+    videoBusy = false;
+  }
 });
 
 app.use((req, res) => {
