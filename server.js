@@ -400,7 +400,7 @@ async function renderMotionMp4(bvhText,destination) {
   const total=parsed.frameCount;
   for(let f=0;f<total;f++){const vals=parsed.flat.slice(f*parsed.channelCount,(f+1)*parsed.channelCount),pts=motionFramePoints(parsed.root,vals);for(const p of pts){bounds.minX=Math.min(bounds.minX,p.p[0]);bounds.maxX=Math.max(bounds.maxX,p.p[0]);bounds.minY=Math.min(bounds.minY,p.p[1]);bounds.maxY=Math.max(bounds.maxY,p.p[1]);}frames.push(pts);}
   const {spawn}=require("node:child_process");
-  const ff=spawn("ffmpeg",["-y","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",w+"x"+h,"-r",String(fps),"-i","pipe:0","-an","-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p","-movflags","+faststart",destination],{stdio:["pipe","ignore","pipe"]});
+  const ff=spawn(require("ffmpeg-static"),["-y","-loglevel","error","-f","rawvideo","-pix_fmt","rgb24","-s",w+"x"+h,"-r",String(fps),"-i","pipe:0","-an","-c:v","libx264","-preset","ultrafast","-crf","30","-pix_fmt","yuv420p","-movflags","+faststart",destination],{stdio:["pipe","ignore","pipe"]});
   let errText="";ff.stderr.on("data",d=>{errText+=d.toString();if(errText.length>3000)errText=errText.slice(-3000);});
   const done=new Promise((resolve,reject)=>{ff.on("error",reject);ff.on("close",code=>code===0?resolve():reject(new Error("FFmpeg failed: "+errText)));});
   for(const pts of frames)await new Promise((resolve,reject)=>ff.stdin.write(motionRaster(pts,bounds,w,h),e=>e?reject(e):resolve()));
